@@ -2,7 +2,7 @@ import streamlit as st
 from st_supabase_connection import SupabaseConnection
 import PyPDF2
 from io import BytesIO
-import anthropic
+import google.generativeai as genai
 import json
 
 st.set_page_config(page_title="DIBPS SO IT Revision Hub", layout="wide", page_icon="📚")
@@ -12,16 +12,23 @@ st.caption("Login • Shared + Private PDFs • AI Summaries • Quizzes • Fla
 # ── Supabase connection ──────────────────────────────────────────────────────
 conn = st.connection("supabase", type=SupabaseConnection)
 
-# ── Anthropic client (key stored in Streamlit secrets) ──────────────────────
-# In your Streamlit Cloud dashboard → App settings → Secrets, add:
-#   ANTHROPIC_API_KEY = "sk-ant-..."
+# ── Gemini setup ─────────────────────────────────────────────────────────────
+# Get your FREE key at: https://aistudio.google.com/apikey
+# Then in Streamlit Cloud → Manage app → Settings → Secrets, add:
+#   GEMINI_API_KEY = "AIza..."
 @st.cache_resource
-def get_anthropic_client():
-    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+def get_gemini_model():
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    return genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=(
+            "You are an expert study assistant for Indian government IT exam preparation. "
+            "Be concise, accurate, and exam-focused."
+        ),
+    )
 
 # ── PDF text extraction ──────────────────────────────────────────────────────
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from PDF bytes. Returns up to 12 000 chars for AI context."""
     try:
         reader = PyPDF2.PdfReader(BytesIO(file_bytes))
         pages = [page.extract_text() or "" for page in reader.pages]
@@ -30,18 +37,19 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         st.error(f"Could not read PDF: {e}")
         return ""
 
-# ── Anthropic helper ─────────────────────────────────────────────────────────
-def ask_claude(system: str, user: str) -> str:
-    client = get_anthropic_client()
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",   # fast + cheap for revision tasks
-        max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return msg.content[0].text
+# ── Gemini helper ─────────────────────────────────────────────────────────────
+def ask_gemini(prompt: str) -> str:
+    model = get_gemini_model()
+    response = model.generate_content(prompt)
+    return response.text
 
-# ── Login / Signup ───────────────────────────────────────────────────────────
+def clean_json(raw: str) -> str:
+    """Strip markdown fences Gemini sometimes wraps around JSON."""
+    return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LOGIN / SIGNUP
+# ════════════════════════════════════════════════════════════════════════════
 if "user" not in st.session_state:
     st.subheader("🔑 Login to your Revision Hub")
     tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
@@ -72,7 +80,9 @@ if "user" not in st.session_state:
 
     st.stop()
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ════════════════════════════════════════════════════════════════════════════
 user = st.session_state.user
 st.sidebar.success(f"👋 {user.email}")
 if st.sidebar.button("Logout"):
@@ -88,23 +98,21 @@ tab_shared, tab_private, tab_ai = st.tabs([
     "🤖 AI Tools",
 ])
 
-# ── Helper: download bytes from a bucket safely ──────────────────────────────
-def safe_download(bucket: str, path: str) -> bytes | None:
-    """Download file bytes from a Supabase storage bucket."""
+# ── Storage helpers ───────────────────────────────────────────────────────────
+def safe_download(bucket: str, path: str):
     try:
         return conn.storage.from_(bucket).download(path)
     except Exception as e:
         st.error(f"Download failed: {e}")
         return None
 
-# ── Helper: upload to bucket, catching duplicate-name error gracefully ───────
 def safe_upload(bucket: str, path: str, data: bytes) -> bool:
     try:
         conn.storage.from_(bucket).upload(path, data)
         return True
     except Exception as e:
         if "already exists" in str(e).lower():
-            st.warning(f"A file named '{path}' already exists. Rename it and retry.")
+            st.warning(f"'{path}' already exists. Rename the file and retry.")
         else:
             st.error(f"Upload error: {e}")
         return False
@@ -117,8 +125,7 @@ with tab_shared:
 
     uploaded = st.file_uploader("Upload PDF to Shared library", type="pdf", key="shared_upload")
     if uploaded:
-        ok = safe_upload("shared-pdfs", uploaded.name, uploaded.getvalue())
-        if ok:
+        if safe_upload("shared-pdfs", uploaded.name, uploaded.getvalue()):
             st.success(f"✅ Uploaded: {uploaded.name}")
             st.rerun()
 
@@ -134,27 +141,19 @@ with tab_shared:
             filename = fi["name"]
             col1, col2, col3 = st.columns([4, 1, 1])
             col1.write(f"📄 {filename}")
-
-            # ── Download ──
             with col2:
                 if st.button("📥 Download", key=f"dl_shared_{filename}"):
                     data = safe_download("shared-pdfs", filename)
                     if data:
-                        st.download_button(
-                            "Save file",
-                            data=data,
-                            file_name=filename,
-                            key=f"save_shared_{filename}",
-                        )
-
-            # ── View extracted text ──
+                        st.download_button("Save file", data=data,
+                                           file_name=filename,
+                                           key=f"save_shared_{filename}")
             with col3:
                 if st.button("👀 View Text", key=f"view_shared_{filename}"):
                     data = safe_download("shared-pdfs", filename)
                     if data:
-                        text = extract_text_from_pdf(data)
-                        st.text_area("Extracted text", text, height=300,
-                                     key=f"txt_shared_{filename}")
+                        st.text_area("Extracted text", extract_text_from_pdf(data),
+                                     height=300, key=f"txt_shared_{filename}")
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PRIVATE PDFs
@@ -166,8 +165,7 @@ with tab_private:
                                         type="pdf", key="private_upload")
     if uploaded_private:
         path = f"{user.id}/{uploaded_private.name}"
-        ok = safe_upload("private-pdfs", path, uploaded_private.getvalue())
-        if ok:
+        if safe_upload("private-pdfs", path, uploaded_private.getvalue()):
             st.success(f"✅ Uploaded to your private library: {uploaded_private.name}")
             st.rerun()
 
@@ -184,25 +182,19 @@ with tab_private:
             full_path = f"{user.id}/{filename}"
             col1, col2, col3 = st.columns([4, 1, 1])
             col1.write(f"🔒 {filename}")
-
             with col2:
                 if st.button("📥 Download", key=f"dl_priv_{filename}"):
                     data = safe_download("private-pdfs", full_path)
                     if data:
-                        st.download_button(
-                            "Save file",
-                            data=data,
-                            file_name=filename,
-                            key=f"save_priv_{filename}",
-                        )
-
+                        st.download_button("Save file", data=data,
+                                           file_name=filename,
+                                           key=f"save_priv_{filename}")
             with col3:
                 if st.button("👀 View Text", key=f"view_priv_{filename}"):
                     data = safe_download("private-pdfs", full_path)
                     if data:
-                        text = extract_text_from_pdf(data)
-                        st.text_area("Extracted text", text, height=300,
-                                     key=f"txt_priv_{filename}")
+                        st.text_area("Extracted text", extract_text_from_pdf(data),
+                                     height=300, key=f"txt_priv_{filename}")
 
 # ════════════════════════════════════════════════════════════════════════════
 #  AI TOOLS
@@ -210,21 +202,15 @@ with tab_private:
 with tab_ai:
     st.subheader("🤖 AI-Powered Revision Tools")
 
-    # ── Build a combined list of all files the user can access ───────────────
-    all_files: list[dict] = []
-
+    all_files = []
     try:
-        shared = conn.storage.from_("shared-pdfs").list() or []
-        for fi in shared:
+        for fi in (conn.storage.from_("shared-pdfs").list() or []):
             all_files.append({"label": f"[Shared] {fi['name']}",
-                               "bucket": "shared-pdfs",
-                               "path": fi["name"]})
+                               "bucket": "shared-pdfs", "path": fi["name"]})
     except Exception:
         pass
-
     try:
-        private = conn.storage.from_("private-pdfs").list(f"{user.id}/") or []
-        for fi in private:
+        for fi in (conn.storage.from_("private-pdfs").list(f"{user.id}/") or []):
             all_files.append({"label": f"[Private] {fi['name']}",
                                "bucket": "private-pdfs",
                                "path": f"{user.id}/{fi['name']}"})
@@ -235,13 +221,11 @@ with tab_ai:
         st.info("Upload PDFs in the Shared or Private tabs first, then come back here.")
         st.stop()
 
-    selected_label = st.selectbox(
-        "Choose a PDF to work with",
-        options=[f["label"] for f in all_files],
-    )
+    selected_label = st.selectbox("Choose a PDF to work with",
+                                  options=[f["label"] for f in all_files])
     selected = next(f for f in all_files if f["label"] == selected_label)
 
-    # ── Load + cache the extracted text so we don't re-download on every click
+    # Cache extracted text so we don't re-download on every button click
     cache_key = f"text_{selected['bucket']}_{selected['path']}"
     if cache_key not in st.session_state:
         with st.spinner("Reading PDF…"):
@@ -251,7 +235,7 @@ with tab_ai:
     pdf_text = st.session_state[cache_key]
 
     if not pdf_text.strip():
-        st.warning("Could not extract text from this PDF (it may be image-based / scanned).")
+        st.warning("Could not extract text (PDF may be scanned/image-based).")
         st.stop()
 
     ai_tab1, ai_tab2, ai_tab3, ai_tab4 = st.tabs(
@@ -262,15 +246,12 @@ with tab_ai:
     with ai_tab1:
         if st.button("Generate Summary", type="primary"):
             with st.spinner("Summarizing…"):
-                summary = ask_claude(
-                    system="You are an expert study assistant for Indian government IT exam preparation. Be concise and exam-focused.",
-                    user=(
-                        "Summarize this document for revision:\n"
-                        "1. 3-sentence overview\n"
-                        "2. Key topics as bullet points\n"
-                        "3. Top 3 facts to memorize for the exam\n\n"
-                        f"Document:\n{pdf_text}"
-                    ),
+                summary = ask_gemini(
+                    "Summarize this document for exam revision:\n"
+                    "1. Write a 3-sentence overview\n"
+                    "2. List key topics as bullet points\n"
+                    "3. State the top 3 facts to memorize for the exam\n\n"
+                    f"Document:\n{pdf_text}"
                 )
             st.markdown(summary)
 
@@ -279,43 +260,32 @@ with tab_ai:
         num_q = st.slider("Number of questions", 3, 10, 5)
         if st.button("Generate Quiz", type="primary"):
             with st.spinner("Creating questions…"):
-                raw = ask_claude(
-                    system="You are a quiz generator for exam prep. Return ONLY valid JSON, no markdown fences.",
-                    user=(
-                        f"Create {num_q} multiple-choice questions from this document.\n"
-                        "Return a JSON array ONLY, like:\n"
-                        '[{"q":"...","options":["A","B","C","D"],"answer":0}]\n'
-                        "answer is the 0-based index of the correct option.\n\n"
-                        f"Document:\n{pdf_text}"
-                    ),
+                raw = ask_gemini(
+                    f"Create {num_q} multiple-choice questions from this document.\n"
+                    "Return a JSON array ONLY — no markdown fences, no explanation:\n"
+                    '[{"q":"question text","options":["A","B","C","D"],"answer":0}]\n'
+                    "answer = 0-based index of the correct option.\n\n"
+                    f"Document:\n{pdf_text}"
                 )
-            # Strip accidental markdown fences
-            cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             try:
-                questions = json.loads(cleaned)
+                questions = json.loads(clean_json(raw))
                 st.session_state["quiz"] = questions
-                st.session_state["quiz_answers"] = {}
             except json.JSONDecodeError:
-                st.error("AI returned malformed JSON. Try again.")
+                st.error("Could not parse quiz. Try again.")
                 st.code(raw)
 
         if "quiz" in st.session_state:
             st.divider()
             for i, q in enumerate(st.session_state["quiz"]):
                 st.markdown(f"**Q{i+1}. {q['q']}**")
-                choice = st.radio(
-                    "Choose an answer",
-                    options=q["options"],
-                    key=f"quiz_q{i}",
-                    index=None,
-                    label_visibility="collapsed",
-                )
+                choice = st.radio("Pick an answer", options=q["options"],
+                                  key=f"quiz_q{i}", index=None,
+                                  label_visibility="collapsed")
                 if choice is not None:
-                    chosen_idx = q["options"].index(choice)
-                    if chosen_idx == q["answer"]:
+                    if q["options"].index(choice) == q["answer"]:
                         st.success("✅ Correct!")
                     else:
-                        st.error(f"❌ Wrong. Correct: {q['options'][q['answer']]}")
+                        st.error(f"❌ Wrong. Correct answer: {q['options'][q['answer']]}")
                 st.write("")
 
     # ── Flashcards ───────────────────────────────────────────────────────────
@@ -323,22 +293,17 @@ with tab_ai:
         num_cards = st.slider("Number of flashcards", 5, 20, 10)
         if st.button("Generate Flashcards", type="primary"):
             with st.spinner("Making flashcards…"):
-                raw = ask_claude(
-                    system="You are a flashcard creator for exam prep. Return ONLY valid JSON, no markdown fences.",
-                    user=(
-                        f"Create {num_cards} flashcards from this document.\n"
-                        "Return a JSON array ONLY:\n"
-                        '[{"front":"term or question","back":"definition or answer"}]\n\n'
-                        f"Document:\n{pdf_text}"
-                    ),
+                raw = ask_gemini(
+                    f"Create {num_cards} flashcards from this document.\n"
+                    "Return a JSON array ONLY — no markdown fences, no explanation:\n"
+                    '[{"front":"term or question","back":"definition or answer"}]\n\n'
+                    f"Document:\n{pdf_text}"
                 )
-            cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             try:
-                cards = json.loads(cleaned)
+                cards = json.loads(clean_json(raw))
                 st.session_state["flashcards"] = cards
-                st.session_state["revealed"] = set()
             except json.JSONDecodeError:
-                st.error("AI returned malformed JSON. Try again.")
+                st.error("Could not parse flashcards. Try again.")
 
         if "flashcards" in st.session_state:
             st.divider()
@@ -350,12 +315,20 @@ with tab_ai:
 
     # ── Chat with PDF ────────────────────────────────────────────────────────
     with ai_tab4:
-        st.caption("Ask anything about this PDF. History is kept during your session.")
+        st.caption("Ask anything about this PDF. Chat history is kept for your session.")
 
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
 
-        # Display existing messages
+        # Start a Gemini chat session primed with the PDF text
+        if "gemini_chat" not in st.session_state:
+            model = get_gemini_model()
+            chat = model.start_chat(history=[])
+            chat.send_message(
+                f"I will ask you questions about this document. Use it as your reference:\n\n{pdf_text}"
+            )
+            st.session_state["gemini_chat"] = chat
+
         for msg in st.session_state["chat_history"]:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
@@ -365,38 +338,18 @@ with tab_ai:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            # Build context-aware messages for Anthropic
-            # Include PDF text only in the first user message
-            messages_for_api = []
-            for j, m in enumerate(st.session_state["chat_history"]):
-                if j == 0 and m["role"] == "user":
-                    messages_for_api.append({
-                        "role": "user",
-                        "content": f"I am studying this document:\n\n{pdf_text}\n\n---\n\n{m['content']}",
-                    })
-                else:
-                    messages_for_api.append(m)
-
             with st.chat_message("assistant"):
                 with st.spinner("Thinking…"):
-                    client = get_anthropic_client()
-                    response = client.messages.create(
-                        model="claude-haiku-4-5-20251001",
-                        max_tokens=1024,
-                        system=(
-                            "You are a helpful study assistant for Indian IT exam preparation. "
-                            "Answer questions based on the provided document. Be concise and accurate."
-                        ),
-                        messages=messages_for_api,
-                    )
-                    answer = response.content[0].text
+                    response = st.session_state["gemini_chat"].send_message(prompt)
+                    answer = response.text
                 st.markdown(answer)
 
             st.session_state["chat_history"].append({"role": "assistant", "content": answer})
 
         if st.button("Clear chat history"):
-            st.session_state["chat_history"] = []
+            st.session_state.pop("chat_history", None)
+            st.session_state.pop("gemini_chat", None)
             st.rerun()
 
 st.divider()
-st.caption("✅ Hosted free on Streamlit Cloud · Data in Supabase · AI by Anthropic Claude")
+st.caption("✅ Hosted free on Streamlit Cloud · Data in Supabase · AI by Google Gemini")
