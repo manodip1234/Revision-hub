@@ -1,5 +1,5 @@
 import streamlit as st
-from st_supabase_connection import SupabaseConnection
+from supabase import create_client, Client
 import PyPDF2
 from io import BytesIO
 import google.generativeai as genai
@@ -9,13 +9,23 @@ st.set_page_config(page_title="DIBPS SO IT Revision Hub", layout="wide", page_ic
 st.title("📚 DIBPS SO IT Revision Hub")
 st.caption("Login • Shared + Private PDFs • AI Summaries • Quizzes • Flashcards • Chat")
 
-# ── Supabase connection ──────────────────────────────────────────────────────
-conn = st.connection("supabase", type=SupabaseConnection)
+# ── Supabase client ──────────────────────────────────────────────────────────
+# Secrets needed in Streamlit Cloud → Manage app → Settings → Secrets:
+#
+# SUPABASE_URL = "https://xxxxxx.supabase.co"
+# SUPABASE_KEY = "sb_publishable_..."
+# GEMINI_API_KEY = "AIza..."
+
+@st.cache_resource
+def get_supabase() -> Client:
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_KEY"],
+    )
+
+supabase = get_supabase()
 
 # ── Gemini setup ─────────────────────────────────────────────────────────────
-# Get your FREE key at: https://aistudio.google.com/apikey
-# Then in Streamlit Cloud → Manage app → Settings → Secrets, add:
-#   GEMINI_API_KEY = "AIza..."
 @st.cache_resource
 def get_gemini_model():
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -37,15 +47,41 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         st.error(f"Could not read PDF: {e}")
         return ""
 
-# ── Gemini helper ─────────────────────────────────────────────────────────────
+# ── Gemini helpers ────────────────────────────────────────────────────────────
 def ask_gemini(prompt: str) -> str:
     model = get_gemini_model()
     response = model.generate_content(prompt)
     return response.text
 
 def clean_json(raw: str) -> str:
-    """Strip markdown fences Gemini sometimes wraps around JSON."""
     return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+# ── Storage helpers ───────────────────────────────────────────────────────────
+def safe_upload(bucket: str, path: str, data: bytes) -> bool:
+    try:
+        supabase.storage.from_(bucket).upload(path, data)
+        return True
+    except Exception as e:
+        msg = str(e)
+        if "already exists" in msg.lower() or "Duplicate" in msg:
+            st.warning(f"'{path}' already exists. Rename the file and retry.")
+        else:
+            st.error(f"Upload error: {msg}")
+        return False
+
+def safe_download(bucket: str, path: str):
+    try:
+        return bytes(supabase.storage.from_(bucket).download(path))
+    except Exception as e:
+        st.error(f"Download failed: {e}")
+        return None
+
+def safe_list(bucket: str, folder: str = "") -> list:
+    try:
+        result = supabase.storage.from_(bucket).list(folder) if folder else supabase.storage.from_(bucket).list()
+        return result or []
+    except Exception:
+        return []
 
 # ════════════════════════════════════════════════════════════════════════════
 #  LOGIN / SIGNUP
@@ -60,12 +96,12 @@ if "user" not in st.session_state:
             password = st.text_input("Password", type="password")
             if st.form_submit_button("Login"):
                 try:
-                    res = conn.auth.sign_in_with_password({"email": email, "password": password})
+                    res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                     st.session_state.user = res.user
                     st.success(f"Welcome {res.user.email}!")
                     st.rerun()
-                except Exception:
-                    st.error("Invalid email or password.")
+                except Exception as e:
+                    st.error(f"Login failed: {e}")
 
     with tab_signup:
         with st.form("signup_form"):
@@ -73,8 +109,8 @@ if "user" not in st.session_state:
             password = st.text_input("Password (min 6 chars)", type="password")
             if st.form_submit_button("Create Account"):
                 try:
-                    conn.auth.sign_up({"email": email, "password": password})
-                    st.success("Account created! Check your email to verify, then log in.")
+                    supabase.auth.sign_up({"email": email, "password": password})
+                    st.success("✅ Account created! Check your email to verify, then log in.")
                 except Exception as e:
                     st.error(str(e))
 
@@ -86,7 +122,7 @@ if "user" not in st.session_state:
 user = st.session_state.user
 st.sidebar.success(f"👋 {user.email}")
 if st.sidebar.button("Logout"):
-    conn.auth.sign_out()
+    supabase.auth.sign_out()
     st.session_state.clear()
     st.rerun()
 
@@ -97,25 +133,6 @@ tab_shared, tab_private, tab_ai = st.tabs([
     "🔒 My Private PDFs",
     "🤖 AI Tools",
 ])
-
-# ── Storage helpers ───────────────────────────────────────────────────────────
-def safe_download(bucket: str, path: str):
-    try:
-        return conn.storage.from_(bucket).download(path)
-    except Exception as e:
-        st.error(f"Download failed: {e}")
-        return None
-
-def safe_upload(bucket: str, path: str, data: bytes) -> bool:
-    try:
-        conn.storage.from_(bucket).upload(path, data)
-        return True
-    except Exception as e:
-        if "already exists" in str(e).lower():
-            st.warning(f"'{path}' already exists. Rename the file and retry.")
-        else:
-            st.error(f"Upload error: {e}")
-        return False
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SHARED PDFs
@@ -129,11 +146,7 @@ with tab_shared:
             st.success(f"✅ Uploaded: {uploaded.name}")
             st.rerun()
 
-    try:
-        files = conn.storage.from_("shared-pdfs").list() or []
-    except Exception:
-        files = []
-
+    files = safe_list("shared-pdfs")
     if not files:
         st.info("No shared PDFs yet. Upload one above!")
     else:
@@ -166,14 +179,10 @@ with tab_private:
     if uploaded_private:
         path = f"{user.id}/{uploaded_private.name}"
         if safe_upload("private-pdfs", path, uploaded_private.getvalue()):
-            st.success(f"✅ Uploaded to your private library: {uploaded_private.name}")
+            st.success(f"✅ Uploaded: {uploaded_private.name}")
             st.rerun()
 
-    try:
-        private_files = conn.storage.from_("private-pdfs").list(f"{user.id}/") or []
-    except Exception:
-        private_files = []
-
+    private_files = safe_list("private-pdfs", folder=user.id)
     if not private_files:
         st.info("No private PDFs yet. Upload one above!")
     else:
@@ -203,19 +212,13 @@ with tab_ai:
     st.subheader("🤖 AI-Powered Revision Tools")
 
     all_files = []
-    try:
-        for fi in (conn.storage.from_("shared-pdfs").list() or []):
-            all_files.append({"label": f"[Shared] {fi['name']}",
-                               "bucket": "shared-pdfs", "path": fi["name"]})
-    except Exception:
-        pass
-    try:
-        for fi in (conn.storage.from_("private-pdfs").list(f"{user.id}/") or []):
-            all_files.append({"label": f"[Private] {fi['name']}",
-                               "bucket": "private-pdfs",
-                               "path": f"{user.id}/{fi['name']}"})
-    except Exception:
-        pass
+    for fi in safe_list("shared-pdfs"):
+        all_files.append({"label": f"[Shared] {fi['name']}",
+                           "bucket": "shared-pdfs", "path": fi["name"]})
+    for fi in safe_list("private-pdfs", folder=user.id):
+        all_files.append({"label": f"[Private] {fi['name']}",
+                           "bucket": "private-pdfs",
+                           "path": f"{user.id}/{fi['name']}"})
 
     if not all_files:
         st.info("Upload PDFs in the Shared or Private tabs first, then come back here.")
@@ -225,7 +228,6 @@ with tab_ai:
                                   options=[f["label"] for f in all_files])
     selected = next(f for f in all_files if f["label"] == selected_label)
 
-    # Cache extracted text so we don't re-download on every button click
     cache_key = f"text_{selected['bucket']}_{selected['path']}"
     if cache_key not in st.session_state:
         with st.spinner("Reading PDF…"):
@@ -268,8 +270,7 @@ with tab_ai:
                     f"Document:\n{pdf_text}"
                 )
             try:
-                questions = json.loads(clean_json(raw))
-                st.session_state["quiz"] = questions
+                st.session_state["quiz"] = json.loads(clean_json(raw))
             except json.JSONDecodeError:
                 st.error("Could not parse quiz. Try again.")
                 st.code(raw)
@@ -285,7 +286,7 @@ with tab_ai:
                     if q["options"].index(choice) == q["answer"]:
                         st.success("✅ Correct!")
                     else:
-                        st.error(f"❌ Wrong. Correct answer: {q['options'][q['answer']]}")
+                        st.error(f"❌ Wrong. Correct: {q['options'][q['answer']]}")
                 st.write("")
 
     # ── Flashcards ───────────────────────────────────────────────────────────
@@ -300,8 +301,7 @@ with tab_ai:
                     f"Document:\n{pdf_text}"
                 )
             try:
-                cards = json.loads(clean_json(raw))
-                st.session_state["flashcards"] = cards
+                st.session_state["flashcards"] = json.loads(clean_json(raw))
             except json.JSONDecodeError:
                 st.error("Could not parse flashcards. Try again.")
 
@@ -319,8 +319,6 @@ with tab_ai:
 
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
-
-        # Start a Gemini chat session primed with the PDF text
         if "gemini_chat" not in st.session_state:
             model = get_gemini_model()
             chat = model.start_chat(history=[])
@@ -337,13 +335,10 @@ with tab_ai:
             st.session_state["chat_history"].append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
-
             with st.chat_message("assistant"):
                 with st.spinner("Thinking…"):
-                    response = st.session_state["gemini_chat"].send_message(prompt)
-                    answer = response.text
+                    answer = st.session_state["gemini_chat"].send_message(prompt).text
                 st.markdown(answer)
-
             st.session_state["chat_history"].append({"role": "assistant", "content": answer})
 
         if st.button("Clear chat history"):
