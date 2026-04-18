@@ -1,4 +1,4 @@
 streamlit
 st-supabase-connection
 PyPDF2
-anthropic
+google-generativeai
